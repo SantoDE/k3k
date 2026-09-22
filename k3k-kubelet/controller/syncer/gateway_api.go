@@ -37,711 +37,313 @@ const (
 	backendTLSPolicyStatusControllerName = "backend-tls-policy-status-syncer-controller"
 )
 
-type GatewayAPIReconciler struct {
-	*Context
-}
-
-func AddGatewayAPISyncer(ctx context.Context, virtMgr, hostMgr manager.Manager, clusterName, clusterNamespace string) error {
-	reconciler := GatewayAPIReconciler{
-		Context: &Context{
+func newGatewayContext(clusterName, clusterNamespace string, virtMgr, hostMgr manager.Manager) *Context {
+	return &Context{
+		ClusterName:      clusterName,
+		ClusterNamespace: clusterNamespace,
+		VirtualClient:    virtMgr.GetClient(),
+		HostClient:       hostMgr.GetClient(),
+		HostReader:       hostMgr.GetAPIReader(),
+		Translator: translate.ToHostTranslator{
 			ClusterName:      clusterName,
 			ClusterNamespace: clusterNamespace,
-			VirtualClient:    virtMgr.GetClient(),
-			HostClient:       hostMgr.GetClient(),
-			HostReader:       hostMgr.GetAPIReader(),
-			Translator: translate.ToHostTranslator{
-				ClusterName:      clusterName,
-				ClusterNamespace: clusterNamespace,
-			},
 		},
 	}
-
-	name := reconciler.Translator.TranslateName(clusterNamespace, gatewayAPIControllerName)
-
-	return ctrl.NewControllerManagedBy(virtMgr).
-		Named(name).
-		For(&gatewayv1.HTTPRoute{}).
-		WithEventFilter(predicate.NewPredicateFuncs(reconciler.filterResources)).
-		Complete(&reconciler)
 }
 
-func (r *GatewayAPIReconciler) filterResources(object ctrlruntimeclient.Object) bool {
+// effectiveSync returns the sync config in effect, preferring a VirtualClusterPolicy override.
+func effectiveSync(cluster *v1beta1.Cluster) *v1beta1.SyncConfig {
+	if cluster.Status.Policy != nil && cluster.Status.Policy.Sync != nil {
+		return cluster.Status.Policy.Sync
+	}
+	if cluster.Spec.Sync != nil {
+		return cluster.Spec.Sync
+	}
+	return &v1beta1.SyncConfig{}
+}
+
+// ── Generic toHost reconciler ─────────────────────────────────────────────────
+
+// toHostReconciler handles the common create/update/delete lifecycle for syncing
+// a single Gateway API type from the virtual cluster to the host cluster.
+type toHostReconciler[T ctrlruntimeclient.Object] struct {
+	*Context
+	finalizer    string
+	syncEnabled  func(*v1beta1.SyncConfig) (enabled bool, selector map[string]string)
+	translateObj func(*Context, T, *v1beta1.SyncConfig) T
+	newObj       func() T
+}
+
+func (r *toHostReconciler[T]) filterResources(object ctrlruntimeclient.Object) bool {
 	var cluster v1beta1.Cluster
-
-	ctx := context.Background()
-
-	if err := r.HostClient.Get(ctx, types.NamespacedName{Name: r.ClusterName, Namespace: r.ClusterNamespace}, &cluster); err != nil {
+	if err := r.HostClient.Get(context.Background(), types.NamespacedName{Name: r.ClusterName, Namespace: r.ClusterNamespace}, &cluster); err != nil {
 		return false
 	}
-
-	syncConfig := cluster.Spec.Sync.HTTPRoutes
-
-	if !syncConfig.Enabled {
+	enabled, selector := r.syncEnabled(effectiveSync(&cluster))
+	if !enabled {
 		return object.GetDeletionTimestamp() != nil
 	}
-
-	labelSelector := labels.SelectorFromSet(syncConfig.Selector)
-	if labelSelector.Empty() {
+	ls := labels.SelectorFromSet(selector)
+	if ls.Empty() {
 		return true
 	}
-
-	return labelSelector.Matches(labels.Set(object.GetLabels()))
+	return ls.Matches(labels.Set(object.GetLabels()))
 }
 
-func (r *GatewayAPIReconciler) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
+func (r *toHostReconciler[T]) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
 	log := ctrl.LoggerFrom(ctx).WithValues("cluster", r.ClusterName, "clusterNamespace", r.ClusterNamespace)
 	ctx = ctrl.LoggerInto(ctx, log)
 
-	log.Info("reconciling gateway api httproute object")
-
-	var (
-		virtHTTPRoute gatewayv1.HTTPRoute
-		cluster       v1beta1.Cluster
-	)
-
+	var cluster v1beta1.Cluster
 	if err := r.HostClient.Get(ctx, types.NamespacedName{Name: r.ClusterName, Namespace: r.ClusterNamespace}, &cluster); err != nil {
 		return reconcile.Result{}, err
 	}
 
-	appliedSync := cluster.Spec.Sync.DeepCopy()
-	if cluster.Status.Policy != nil && cluster.Status.Policy.Sync != nil {
-		appliedSync = cluster.Status.Policy.Sync
-	}
-
-	syncConfig := appliedSync.HTTPRoutes
-
-	if err := r.VirtualClient.Get(ctx, req.NamespacedName, &virtHTTPRoute); err != nil {
+	virtObj := r.newObj()
+	if err := r.VirtualClient.Get(ctx, req.NamespacedName, virtObj); err != nil {
 		return reconcile.Result{}, ctrlruntimeclient.IgnoreNotFound(err)
 	}
 
-	syncedHTTPRoute := r.httproute(&virtHTTPRoute, syncConfig)
+	syncedObj := r.translateObj(r.Context, virtObj, effectiveSync(&cluster))
 
-	if err := controllerutil.SetOwnerReference(&cluster, syncedHTTPRoute, r.HostClient.Scheme()); err != nil {
+	if err := controllerutil.SetOwnerReference(&cluster, syncedObj, r.HostClient.Scheme()); err != nil {
 		return reconcile.Result{}, err
 	}
 
-	if !virtHTTPRoute.DeletionTimestamp.IsZero() {
-		if err := r.HostClient.Delete(ctx, syncedHTTPRoute); err != nil {
+	if !virtObj.GetDeletionTimestamp().IsZero() {
+		if err := r.HostClient.Delete(ctx, syncedObj); err != nil {
 			return reconcile.Result{}, ctrlruntimeclient.IgnoreNotFound(err)
 		}
-
-		if controllerutil.RemoveFinalizer(&virtHTTPRoute, gatewayAPIFinalizerName) {
-			if err := r.VirtualClient.Update(ctx, &virtHTTPRoute); err != nil {
-				return reconcile.Result{}, err
-			}
+		if controllerutil.RemoveFinalizer(virtObj, r.finalizer) {
+			return reconcile.Result{}, r.VirtualClient.Update(ctx, virtObj)
 		}
-
 		return reconcile.Result{}, nil
 	}
 
-	if controllerutil.AddFinalizer(&virtHTTPRoute, gatewayAPIFinalizerName) {
-		if err := r.VirtualClient.Update(ctx, &virtHTTPRoute); err != nil {
+	if controllerutil.AddFinalizer(virtObj, r.finalizer) {
+		if err := r.VirtualClient.Update(ctx, virtObj); err != nil {
 			return reconcile.Result{}, err
 		}
 	}
 
-	var hostHTTPRoute gatewayv1.HTTPRoute
-	if err := r.HostReader.Get(ctx, types.NamespacedName{Name: syncedHTTPRoute.Name, Namespace: syncedHTTPRoute.Namespace}, &hostHTTPRoute); err != nil {
+	hostObj := r.newObj()
+	if err := r.HostReader.Get(ctx, types.NamespacedName{Name: syncedObj.GetName(), Namespace: syncedObj.GetNamespace()}, hostObj); err != nil {
 		if apierrors.IsNotFound(err) {
-			log.Info("creating httproute on the host cluster")
-			return reconcile.Result{}, r.HostClient.Create(ctx, syncedHTTPRoute)
+			log.Info("creating resource on the host cluster")
+			return reconcile.Result{}, r.HostClient.Create(ctx, syncedObj)
 		}
-
 		return reconcile.Result{}, err
 	}
 
-	log.Info("updating httproute on the host cluster")
-
-	syncedHTTPRoute.ResourceVersion = hostHTTPRoute.ResourceVersion
-	return reconcile.Result{}, r.HostClient.Update(ctx, syncedHTTPRoute)
+	log.Info("updating resource on the host cluster")
+	syncedObj.SetResourceVersion(hostObj.GetResourceVersion())
+	return reconcile.Result{}, r.HostClient.Update(ctx, syncedObj)
 }
 
-func (r *GatewayAPIReconciler) httproute(obj *gatewayv1.HTTPRoute, syncConfig v1beta1.GatewayAPISyncConfig) *gatewayv1.HTTPRoute {
-	hostHTTPRoute := obj.DeepCopy()
-	r.Translator.TranslateTo(hostHTTPRoute)
+func addToHostSyncer[T ctrlruntimeclient.Object](virtMgr manager.Manager, rec *toHostReconciler[T], controllerName string) error {
+	name := rec.Translator.TranslateName(rec.ClusterNamespace, controllerName)
+	return ctrl.NewControllerManagedBy(virtMgr).
+		Named(name).
+		For(rec.newObj()).
+		WithEventFilter(predicate.NewPredicateFuncs(rec.filterResources)).
+		Complete(rec)
+}
 
-	if syncConfig.OverrideParentGateway != nil {
-		ns := gatewayv1.Namespace(syncConfig.OverrideParentGateway.Namespace)
-		hostHTTPRoute.Spec.ParentRefs = []gatewayv1.ParentReference{{
-			Name:      gatewayv1.ObjectName(syncConfig.OverrideParentGateway.Name),
+// ── Generic status reconciler ─────────────────────────────────────────────────
+
+// statusReconciler mirrors the Status field of a host Gateway API object back to
+// the corresponding virtual cluster object, identified via k3k annotations.
+type statusReconciler[T ctrlruntimeclient.Object] struct {
+	*Context
+	kind   string
+	newObj func() T
+}
+
+func (r *statusReconciler[T]) filterClusterObjects(obj ctrlruntimeclient.Object) bool {
+	return obj.GetLabels()[translate.ClusterNameLabel] == r.ClusterName
+}
+
+func (r *statusReconciler[T]) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
+	log := ctrl.LoggerFrom(ctx).WithValues("cluster", r.ClusterName, "clusterNamespace", r.ClusterNamespace)
+	ctx = ctrl.LoggerInto(ctx, log)
+
+	hostObj := r.newObj()
+	if err := r.HostClient.Get(ctx, req.NamespacedName, hostObj); err != nil {
+		return reconcile.Result{}, ctrlruntimeclient.IgnoreNotFound(err)
+	}
+
+	annotations := hostObj.GetAnnotations()
+	virtName := annotations[translate.ResourceNameAnnotation]
+	virtNamespace := annotations[translate.ResourceNamespaceAnnotation]
+	if virtName == "" || virtNamespace == "" {
+		return reconcile.Result{}, nil
+	}
+
+	virtObj := r.newObj()
+	if err := r.VirtualClient.Get(ctx, types.NamespacedName{Name: virtName, Namespace: virtNamespace}, virtObj); err != nil {
+		return reconcile.Result{}, ctrlruntimeclient.IgnoreNotFound(err)
+	}
+
+	hostStatus := reflect.ValueOf(hostObj).Elem().FieldByName("Status")
+	virtStatus := reflect.ValueOf(virtObj).Elem().FieldByName("Status")
+	if reflect.DeepEqual(virtStatus.Interface(), hostStatus.Interface()) {
+		return reconcile.Result{}, nil
+	}
+
+	log.Info("mirroring "+r.kind+" status to virtual cluster", "name", virtName, "namespace", virtNamespace)
+	virtStatus.Set(hostStatus)
+	return reconcile.Result{}, r.VirtualClient.Status().Update(ctx, virtObj)
+}
+
+func addStatusSyncer[T ctrlruntimeclient.Object](hostMgr manager.Manager, rec *statusReconciler[T], controllerName string) error {
+	name := rec.Translator.TranslateName(rec.ClusterNamespace, controllerName)
+	return ctrl.NewControllerManagedBy(hostMgr).
+		Named(name).
+		For(rec.newObj()).
+		WithEventFilter(predicate.NewPredicateFuncs(rec.filterClusterObjects)).
+		Complete(rec)
+}
+
+// ── Translation functions ─────────────────────────────────────────────────────
+
+func translateParentRefs(ctx *Context, refs []gatewayv1.ParentReference, srcNamespace string, override *v1beta1.GatewayParentRef) []gatewayv1.ParentReference {
+	if override != nil {
+		ns := gatewayv1.Namespace(override.Namespace)
+		return []gatewayv1.ParentReference{{
+			Name:      gatewayv1.ObjectName(override.Name),
 			Namespace: &ns,
 		}}
-	} else {
-		for i := range hostHTTPRoute.Spec.ParentRefs {
-			ref := &hostHTTPRoute.Spec.ParentRefs[i]
-			srcNS := obj.Namespace
-			if ref.Namespace != nil {
-				srcNS = string(*ref.Namespace)
-			}
-			ref.Name = gatewayv1.ObjectName(r.Translator.TranslateName(srcNS, string(ref.Name)))
-			ns := gatewayv1.Namespace(r.ClusterNamespace)
-			ref.Namespace = &ns
+	}
+	out := make([]gatewayv1.ParentReference, len(refs))
+	copy(out, refs)
+	for i := range out {
+		srcNS := srcNamespace
+		if out[i].Namespace != nil {
+			srcNS = string(*out[i].Namespace)
+		}
+		out[i].Name = gatewayv1.ObjectName(ctx.Translator.TranslateName(srcNS, string(refs[i].Name)))
+		ns := gatewayv1.Namespace(ctx.ClusterNamespace)
+		out[i].Namespace = &ns
+	}
+	return out
+}
+
+func translateHTTPRoute(ctx *Context, obj *gatewayv1.HTTPRoute, sync *v1beta1.SyncConfig) *gatewayv1.HTTPRoute {
+	out := obj.DeepCopy()
+	ctx.Translator.TranslateTo(out)
+	out.Spec.ParentRefs = translateParentRefs(ctx, obj.Spec.ParentRefs, obj.Namespace, sync.HTTPRoutes.OverrideParentGateway)
+	for i := range out.Spec.Rules {
+		for j := range out.Spec.Rules[i].BackendRefs {
+			out.Spec.Rules[i].BackendRefs[j].Name = gatewayv1.ObjectName(
+				ctx.Translator.TranslateName(obj.Namespace, string(obj.Spec.Rules[i].BackendRefs[j].Name)),
+			)
 		}
 	}
+	return out
+}
 
-	for i := range hostHTTPRoute.Spec.Rules {
-		for j := range hostHTTPRoute.Spec.Rules[i].BackendRefs {
-			ref := &hostHTTPRoute.Spec.Rules[i].BackendRefs[j]
-			ref.Name = gatewayv1.ObjectName(r.Translator.TranslateName(obj.Namespace, string(ref.Name)))
+func translateTLSRoute(ctx *Context, obj *gatewayv1.TLSRoute, sync *v1beta1.SyncConfig) *gatewayv1.TLSRoute {
+	out := obj.DeepCopy()
+	ctx.Translator.TranslateTo(out)
+	out.Spec.ParentRefs = translateParentRefs(ctx, obj.Spec.ParentRefs, obj.Namespace, sync.TLSRoutes.OverrideParentGateway)
+	for i := range out.Spec.Rules {
+		for j := range out.Spec.Rules[i].BackendRefs {
+			out.Spec.Rules[i].BackendRefs[j].Name = gatewayv1.ObjectName(
+				ctx.Translator.TranslateName(obj.Namespace, string(obj.Spec.Rules[i].BackendRefs[j].Name)),
+			)
 		}
 	}
-
-	return hostHTTPRoute
+	return out
 }
 
-// GatewayAPIStatusReconciler watches HTTPRoute objects on the host cluster and mirrors
-// their status back to the corresponding virtual cluster HTTPRoute.
-type GatewayAPIStatusReconciler struct {
-	*Context
+func translateReferenceGrant(ctx *Context, obj *gatewayv1.ReferenceGrant, _ *v1beta1.SyncConfig) *gatewayv1.ReferenceGrant {
+	out := obj.DeepCopy()
+	ctx.Translator.TranslateTo(out)
+	// All virtual-cluster namespaces collapse to clusterNamespace on the host.
+	for i := range out.Spec.From {
+		out.Spec.From[i].Namespace = gatewayv1.Namespace(ctx.ClusterNamespace)
+	}
+	return out
 }
 
-// AddGatewayAPIStatusSyncer registers a controller on the host manager that watches host
-// HTTPRoutes and propagates their status to the matching virtual HTTPRoute.
-func AddGatewayAPIStatusSyncer(ctx context.Context, virtMgr, hostMgr manager.Manager, clusterName, clusterNamespace string) error {
-	reconciler := GatewayAPIStatusReconciler{
-		Context: &Context{
-			ClusterName:      clusterName,
-			ClusterNamespace: clusterNamespace,
-			VirtualClient:    virtMgr.GetClient(),
-			HostClient:       hostMgr.GetClient(),
-			HostReader:       hostMgr.GetAPIReader(),
-			Translator: translate.ToHostTranslator{
-				ClusterName:      clusterName,
-				ClusterNamespace: clusterNamespace,
-			},
-		},
-	}
-
-	name := reconciler.Translator.TranslateName(clusterNamespace, gatewayAPIStatusControllerName)
-
-	return ctrl.NewControllerManagedBy(hostMgr).
-		Named(name).
-		For(&gatewayv1.HTTPRoute{}).
-		WithEventFilter(predicate.NewPredicateFuncs(reconciler.filterHostRoutes)).
-		Complete(&reconciler)
-}
-
-// filterHostRoutes selects only host HTTPRoutes that belong to this virtual cluster.
-// The hostMgr cache is already scoped to clusterNamespace, so namespace filtering is implicit.
-func (r *GatewayAPIStatusReconciler) filterHostRoutes(obj ctrlruntimeclient.Object) bool {
-	return obj.GetLabels()[translate.ClusterNameLabel] == r.ClusterName
-}
-
-func (r *GatewayAPIStatusReconciler) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
-	log := ctrl.LoggerFrom(ctx).WithValues("cluster", r.ClusterName, "clusterNamespace", r.ClusterNamespace)
-	ctx = ctrl.LoggerInto(ctx, log)
-
-	var hostRoute gatewayv1.HTTPRoute
-	if err := r.HostClient.Get(ctx, req.NamespacedName, &hostRoute); err != nil {
-		return reconcile.Result{}, ctrlruntimeclient.IgnoreNotFound(err)
-	}
-
-	annotations := hostRoute.GetAnnotations()
-	virtName := annotations[translate.ResourceNameAnnotation]
-	virtNamespace := annotations[translate.ResourceNamespaceAnnotation]
-	if virtName == "" || virtNamespace == "" {
-		return reconcile.Result{}, nil
-	}
-
-	var virtRoute gatewayv1.HTTPRoute
-	if err := r.VirtualClient.Get(ctx, types.NamespacedName{Name: virtName, Namespace: virtNamespace}, &virtRoute); err != nil {
-		return reconcile.Result{}, ctrlruntimeclient.IgnoreNotFound(err)
-	}
-
-	if reflect.DeepEqual(virtRoute.Status, hostRoute.Status) {
-		return reconcile.Result{}, nil
-	}
-
-	log.Info("mirroring httproute status to virtual cluster", "name", virtName, "namespace", virtNamespace)
-	virtRoute.Status = hostRoute.Status
-	return reconcile.Result{}, r.VirtualClient.Status().Update(ctx, &virtRoute)
-}
-
-// ── TLSRoute ──────────────────────────────────────────────────────────────────
-
-type TLSRouteReconciler struct {
-	*Context
-}
-
-func AddTLSRouteSyncer(ctx context.Context, virtMgr, hostMgr manager.Manager, clusterName, clusterNamespace string) error {
-	reconciler := TLSRouteReconciler{
-		Context: &Context{
-			ClusterName:      clusterName,
-			ClusterNamespace: clusterNamespace,
-			VirtualClient:    virtMgr.GetClient(),
-			HostClient:       hostMgr.GetClient(),
-			HostReader:       hostMgr.GetAPIReader(),
-			Translator: translate.ToHostTranslator{
-				ClusterName:      clusterName,
-				ClusterNamespace: clusterNamespace,
-			},
-		},
-	}
-	name := reconciler.Translator.TranslateName(clusterNamespace, tlsRouteControllerName)
-	return ctrl.NewControllerManagedBy(virtMgr).
-		Named(name).
-		For(&gatewayv1.TLSRoute{}).
-		WithEventFilter(predicate.NewPredicateFuncs(reconciler.filterResources)).
-		Complete(&reconciler)
-}
-
-func (r *TLSRouteReconciler) filterResources(object ctrlruntimeclient.Object) bool {
-	var cluster v1beta1.Cluster
-	ctx := context.Background()
-	if err := r.HostClient.Get(ctx, types.NamespacedName{Name: r.ClusterName, Namespace: r.ClusterNamespace}, &cluster); err != nil {
-		return false
-	}
-	syncConfig := cluster.Spec.Sync.TLSRoutes
-	if !syncConfig.Enabled {
-		return object.GetDeletionTimestamp() != nil
-	}
-	labelSelector := labels.SelectorFromSet(syncConfig.Selector)
-	if labelSelector.Empty() {
-		return true
-	}
-	return labelSelector.Matches(labels.Set(object.GetLabels()))
-}
-
-func (r *TLSRouteReconciler) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
-	log := ctrl.LoggerFrom(ctx).WithValues("cluster", r.ClusterName, "clusterNamespace", r.ClusterNamespace)
-	ctx = ctrl.LoggerInto(ctx, log)
-
-	var (
-		virtTLSRoute gatewayv1.TLSRoute
-		cluster      v1beta1.Cluster
-	)
-
-	if err := r.HostClient.Get(ctx, types.NamespacedName{Name: r.ClusterName, Namespace: r.ClusterNamespace}, &cluster); err != nil {
-		return reconcile.Result{}, err
-	}
-
-	appliedSync := cluster.Spec.Sync.DeepCopy()
-	if cluster.Status.Policy != nil && cluster.Status.Policy.Sync != nil {
-		appliedSync = cluster.Status.Policy.Sync
-	}
-
-	if err := r.VirtualClient.Get(ctx, req.NamespacedName, &virtTLSRoute); err != nil {
-		return reconcile.Result{}, ctrlruntimeclient.IgnoreNotFound(err)
-	}
-
-	syncedTLSRoute := r.tlsroute(&virtTLSRoute, appliedSync.TLSRoutes)
-
-	if err := controllerutil.SetOwnerReference(&cluster, syncedTLSRoute, r.HostClient.Scheme()); err != nil {
-		return reconcile.Result{}, err
-	}
-
-	if !virtTLSRoute.DeletionTimestamp.IsZero() {
-		if err := r.HostClient.Delete(ctx, syncedTLSRoute); err != nil {
-			return reconcile.Result{}, ctrlruntimeclient.IgnoreNotFound(err)
-		}
-		if controllerutil.RemoveFinalizer(&virtTLSRoute, tlsRouteFinalizerName) {
-			if err := r.VirtualClient.Update(ctx, &virtTLSRoute); err != nil {
-				return reconcile.Result{}, err
-			}
-		}
-		return reconcile.Result{}, nil
-	}
-
-	if controllerutil.AddFinalizer(&virtTLSRoute, tlsRouteFinalizerName) {
-		if err := r.VirtualClient.Update(ctx, &virtTLSRoute); err != nil {
-			return reconcile.Result{}, err
-		}
-	}
-
-	var hostTLSRoute gatewayv1.TLSRoute
-	if err := r.HostReader.Get(ctx, types.NamespacedName{Name: syncedTLSRoute.Name, Namespace: syncedTLSRoute.Namespace}, &hostTLSRoute); err != nil {
-		if apierrors.IsNotFound(err) {
-			log.Info("creating tlsroute on the host cluster")
-			return reconcile.Result{}, r.HostClient.Create(ctx, syncedTLSRoute)
-		}
-		return reconcile.Result{}, err
-	}
-
-	log.Info("updating tlsroute on the host cluster")
-	syncedTLSRoute.ResourceVersion = hostTLSRoute.ResourceVersion
-	return reconcile.Result{}, r.HostClient.Update(ctx, syncedTLSRoute)
-}
-
-func (r *TLSRouteReconciler) tlsroute(obj *gatewayv1.TLSRoute, syncConfig v1beta1.GatewayAPISyncConfig) *gatewayv1.TLSRoute {
-	hostTLSRoute := obj.DeepCopy()
-	r.Translator.TranslateTo(hostTLSRoute)
-
-	if syncConfig.OverrideParentGateway != nil {
-		ns := gatewayv1.Namespace(syncConfig.OverrideParentGateway.Namespace)
-		hostTLSRoute.Spec.ParentRefs = []gatewayv1.ParentReference{{
-			Name:      gatewayv1.ObjectName(syncConfig.OverrideParentGateway.Name),
-			Namespace: &ns,
-		}}
-	} else {
-		for i := range hostTLSRoute.Spec.ParentRefs {
-			ref := &hostTLSRoute.Spec.ParentRefs[i]
-			srcNS := obj.Namespace
-			if ref.Namespace != nil {
-				srcNS = string(*ref.Namespace)
-			}
-			ref.Name = gatewayv1.ObjectName(r.Translator.TranslateName(srcNS, string(ref.Name)))
-			ns := gatewayv1.Namespace(r.ClusterNamespace)
-			ref.Namespace = &ns
-		}
-	}
-
-	for i := range hostTLSRoute.Spec.Rules {
-		for j := range hostTLSRoute.Spec.Rules[i].BackendRefs {
-			ref := &hostTLSRoute.Spec.Rules[i].BackendRefs[j]
-			ref.Name = gatewayv1.ObjectName(r.Translator.TranslateName(obj.Namespace, string(ref.Name)))
-		}
-	}
-
-	return hostTLSRoute
-}
-
-type TLSRouteStatusReconciler struct {
-	*Context
-}
-
-func AddTLSRouteStatusSyncer(ctx context.Context, virtMgr, hostMgr manager.Manager, clusterName, clusterNamespace string) error {
-	reconciler := TLSRouteStatusReconciler{
-		Context: &Context{
-			ClusterName:      clusterName,
-			ClusterNamespace: clusterNamespace,
-			VirtualClient:    virtMgr.GetClient(),
-			HostClient:       hostMgr.GetClient(),
-			HostReader:       hostMgr.GetAPIReader(),
-			Translator: translate.ToHostTranslator{
-				ClusterName:      clusterName,
-				ClusterNamespace: clusterNamespace,
-			},
-		},
-	}
-	name := reconciler.Translator.TranslateName(clusterNamespace, tlsRouteStatusControllerName)
-	return ctrl.NewControllerManagedBy(hostMgr).
-		Named(name).
-		For(&gatewayv1.TLSRoute{}).
-		WithEventFilter(predicate.NewPredicateFuncs(reconciler.filterHostRoutes)).
-		Complete(&reconciler)
-}
-
-func (r *TLSRouteStatusReconciler) filterHostRoutes(obj ctrlruntimeclient.Object) bool {
-	return obj.GetLabels()[translate.ClusterNameLabel] == r.ClusterName
-}
-
-func (r *TLSRouteStatusReconciler) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
-	log := ctrl.LoggerFrom(ctx).WithValues("cluster", r.ClusterName, "clusterNamespace", r.ClusterNamespace)
-	ctx = ctrl.LoggerInto(ctx, log)
-
-	var hostRoute gatewayv1.TLSRoute
-	if err := r.HostClient.Get(ctx, req.NamespacedName, &hostRoute); err != nil {
-		return reconcile.Result{}, ctrlruntimeclient.IgnoreNotFound(err)
-	}
-
-	annotations := hostRoute.GetAnnotations()
-	virtName := annotations[translate.ResourceNameAnnotation]
-	virtNamespace := annotations[translate.ResourceNamespaceAnnotation]
-	if virtName == "" || virtNamespace == "" {
-		return reconcile.Result{}, nil
-	}
-
-	var virtRoute gatewayv1.TLSRoute
-	if err := r.VirtualClient.Get(ctx, types.NamespacedName{Name: virtName, Namespace: virtNamespace}, &virtRoute); err != nil {
-		return reconcile.Result{}, ctrlruntimeclient.IgnoreNotFound(err)
-	}
-
-	if reflect.DeepEqual(virtRoute.Status, hostRoute.Status) {
-		return reconcile.Result{}, nil
-	}
-
-	log.Info("mirroring tlsroute status to virtual cluster", "name", virtName, "namespace", virtNamespace)
-	virtRoute.Status = hostRoute.Status
-	return reconcile.Result{}, r.VirtualClient.Status().Update(ctx, &virtRoute)
-}
-
-// ── ReferenceGrant ────────────────────────────────────────────────────────────
-
-type ReferenceGrantReconciler struct {
-	*Context
-}
-
-func AddReferenceGrantSyncer(ctx context.Context, virtMgr, hostMgr manager.Manager, clusterName, clusterNamespace string) error {
-	reconciler := ReferenceGrantReconciler{
-		Context: &Context{
-			ClusterName:      clusterName,
-			ClusterNamespace: clusterNamespace,
-			VirtualClient:    virtMgr.GetClient(),
-			HostClient:       hostMgr.GetClient(),
-			HostReader:       hostMgr.GetAPIReader(),
-			Translator: translate.ToHostTranslator{
-				ClusterName:      clusterName,
-				ClusterNamespace: clusterNamespace,
-			},
-		},
-	}
-	name := reconciler.Translator.TranslateName(clusterNamespace, referenceGrantControllerName)
-	return ctrl.NewControllerManagedBy(virtMgr).
-		Named(name).
-		For(&gatewayv1.ReferenceGrant{}).
-		WithEventFilter(predicate.NewPredicateFuncs(reconciler.filterResources)).
-		Complete(&reconciler)
-}
-
-func (r *ReferenceGrantReconciler) filterResources(object ctrlruntimeclient.Object) bool {
-	var cluster v1beta1.Cluster
-	ctx := context.Background()
-	if err := r.HostClient.Get(ctx, types.NamespacedName{Name: r.ClusterName, Namespace: r.ClusterNamespace}, &cluster); err != nil {
-		return false
-	}
-	syncConfig := cluster.Spec.Sync.ReferenceGrants
-	if !syncConfig.Enabled {
-		return object.GetDeletionTimestamp() != nil
-	}
-	labelSelector := labels.SelectorFromSet(syncConfig.Selector)
-	if labelSelector.Empty() {
-		return true
-	}
-	return labelSelector.Matches(labels.Set(object.GetLabels()))
-}
-
-func (r *ReferenceGrantReconciler) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
-	log := ctrl.LoggerFrom(ctx).WithValues("cluster", r.ClusterName, "clusterNamespace", r.ClusterNamespace)
-	ctx = ctrl.LoggerInto(ctx, log)
-
-	var (
-		virtGrant gatewayv1.ReferenceGrant
-		cluster   v1beta1.Cluster
-	)
-
-	if err := r.HostClient.Get(ctx, types.NamespacedName{Name: r.ClusterName, Namespace: r.ClusterNamespace}, &cluster); err != nil {
-		return reconcile.Result{}, err
-	}
-
-	if err := r.VirtualClient.Get(ctx, req.NamespacedName, &virtGrant); err != nil {
-		return reconcile.Result{}, ctrlruntimeclient.IgnoreNotFound(err)
-	}
-
-	syncedGrant := r.referenceGrant(&virtGrant)
-
-	if err := controllerutil.SetOwnerReference(&cluster, syncedGrant, r.HostClient.Scheme()); err != nil {
-		return reconcile.Result{}, err
-	}
-
-	if !virtGrant.DeletionTimestamp.IsZero() {
-		if err := r.HostClient.Delete(ctx, syncedGrant); err != nil {
-			return reconcile.Result{}, ctrlruntimeclient.IgnoreNotFound(err)
-		}
-		if controllerutil.RemoveFinalizer(&virtGrant, referenceGrantFinalizerName) {
-			if err := r.VirtualClient.Update(ctx, &virtGrant); err != nil {
-				return reconcile.Result{}, err
-			}
-		}
-		return reconcile.Result{}, nil
-	}
-
-	if controllerutil.AddFinalizer(&virtGrant, referenceGrantFinalizerName) {
-		if err := r.VirtualClient.Update(ctx, &virtGrant); err != nil {
-			return reconcile.Result{}, err
-		}
-	}
-
-	var hostGrant gatewayv1.ReferenceGrant
-	if err := r.HostReader.Get(ctx, types.NamespacedName{Name: syncedGrant.Name, Namespace: syncedGrant.Namespace}, &hostGrant); err != nil {
-		if apierrors.IsNotFound(err) {
-			log.Info("creating referencegrant on the host cluster")
-			return reconcile.Result{}, r.HostClient.Create(ctx, syncedGrant)
-		}
-		return reconcile.Result{}, err
-	}
-
-	log.Info("updating referencegrant on the host cluster")
-	syncedGrant.ResourceVersion = hostGrant.ResourceVersion
-	return reconcile.Result{}, r.HostClient.Update(ctx, syncedGrant)
-}
-
-func (r *ReferenceGrantReconciler) referenceGrant(obj *gatewayv1.ReferenceGrant) *gatewayv1.ReferenceGrant {
-	hostGrant := obj.DeepCopy()
-	r.Translator.TranslateTo(hostGrant)
-
-	// All virtual-cluster namespaces map to clusterNamespace on the host.
-	for i := range hostGrant.Spec.From {
-		hostGrant.Spec.From[i].Namespace = gatewayv1.Namespace(r.ClusterNamespace)
-	}
-
-	return hostGrant
-}
-
-// ── BackendTLSPolicy ──────────────────────────────────────────────────────────
-
-type BackendTLSPolicyReconciler struct {
-	*Context
-}
-
-func AddBackendTLSPolicySyncer(ctx context.Context, virtMgr, hostMgr manager.Manager, clusterName, clusterNamespace string) error {
-	reconciler := BackendTLSPolicyReconciler{
-		Context: &Context{
-			ClusterName:      clusterName,
-			ClusterNamespace: clusterNamespace,
-			VirtualClient:    virtMgr.GetClient(),
-			HostClient:       hostMgr.GetClient(),
-			HostReader:       hostMgr.GetAPIReader(),
-			Translator: translate.ToHostTranslator{
-				ClusterName:      clusterName,
-				ClusterNamespace: clusterNamespace,
-			},
-		},
-	}
-	name := reconciler.Translator.TranslateName(clusterNamespace, backendTLSPolicyControllerName)
-	return ctrl.NewControllerManagedBy(virtMgr).
-		Named(name).
-		For(&gatewayv1.BackendTLSPolicy{}).
-		WithEventFilter(predicate.NewPredicateFuncs(reconciler.filterResources)).
-		Complete(&reconciler)
-}
-
-func (r *BackendTLSPolicyReconciler) filterResources(object ctrlruntimeclient.Object) bool {
-	var cluster v1beta1.Cluster
-	ctx := context.Background()
-	if err := r.HostClient.Get(ctx, types.NamespacedName{Name: r.ClusterName, Namespace: r.ClusterNamespace}, &cluster); err != nil {
-		return false
-	}
-	syncConfig := cluster.Spec.Sync.BackendTLSPolicies
-	if !syncConfig.Enabled {
-		return object.GetDeletionTimestamp() != nil
-	}
-	labelSelector := labels.SelectorFromSet(syncConfig.Selector)
-	if labelSelector.Empty() {
-		return true
-	}
-	return labelSelector.Matches(labels.Set(object.GetLabels()))
-}
-
-func (r *BackendTLSPolicyReconciler) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
-	log := ctrl.LoggerFrom(ctx).WithValues("cluster", r.ClusterName, "clusterNamespace", r.ClusterNamespace)
-	ctx = ctrl.LoggerInto(ctx, log)
-
-	var (
-		virtPolicy gatewayv1.BackendTLSPolicy
-		cluster    v1beta1.Cluster
-	)
-
-	if err := r.HostClient.Get(ctx, types.NamespacedName{Name: r.ClusterName, Namespace: r.ClusterNamespace}, &cluster); err != nil {
-		return reconcile.Result{}, err
-	}
-
-	if err := r.VirtualClient.Get(ctx, req.NamespacedName, &virtPolicy); err != nil {
-		return reconcile.Result{}, ctrlruntimeclient.IgnoreNotFound(err)
-	}
-
-	syncedPolicy := r.backendTLSPolicy(&virtPolicy)
-
-	if err := controllerutil.SetOwnerReference(&cluster, syncedPolicy, r.HostClient.Scheme()); err != nil {
-		return reconcile.Result{}, err
-	}
-
-	if !virtPolicy.DeletionTimestamp.IsZero() {
-		if err := r.HostClient.Delete(ctx, syncedPolicy); err != nil {
-			return reconcile.Result{}, ctrlruntimeclient.IgnoreNotFound(err)
-		}
-		if controllerutil.RemoveFinalizer(&virtPolicy, backendTLSPolicyFinalizerName) {
-			if err := r.VirtualClient.Update(ctx, &virtPolicy); err != nil {
-				return reconcile.Result{}, err
-			}
-		}
-		return reconcile.Result{}, nil
-	}
-
-	if controllerutil.AddFinalizer(&virtPolicy, backendTLSPolicyFinalizerName) {
-		if err := r.VirtualClient.Update(ctx, &virtPolicy); err != nil {
-			return reconcile.Result{}, err
-		}
-	}
-
-	var hostPolicy gatewayv1.BackendTLSPolicy
-	if err := r.HostReader.Get(ctx, types.NamespacedName{Name: syncedPolicy.Name, Namespace: syncedPolicy.Namespace}, &hostPolicy); err != nil {
-		if apierrors.IsNotFound(err) {
-			log.Info("creating backendtlspolicy on the host cluster")
-			return reconcile.Result{}, r.HostClient.Create(ctx, syncedPolicy)
-		}
-		return reconcile.Result{}, err
-	}
-
-	log.Info("updating backendtlspolicy on the host cluster")
-	syncedPolicy.ResourceVersion = hostPolicy.ResourceVersion
-	return reconcile.Result{}, r.HostClient.Update(ctx, syncedPolicy)
-}
-
-func (r *BackendTLSPolicyReconciler) backendTLSPolicy(obj *gatewayv1.BackendTLSPolicy) *gatewayv1.BackendTLSPolicy {
-	hostPolicy := obj.DeepCopy()
-	r.Translator.TranslateTo(hostPolicy)
-
-	for i := range hostPolicy.Spec.TargetRefs {
-		hostPolicy.Spec.TargetRefs[i].Name = gatewayv1.ObjectName(
-			r.Translator.TranslateName(obj.Namespace, string(obj.Spec.TargetRefs[i].Name)),
+func translateBackendTLSPolicy(ctx *Context, obj *gatewayv1.BackendTLSPolicy, _ *v1beta1.SyncConfig) *gatewayv1.BackendTLSPolicy {
+	out := obj.DeepCopy()
+	ctx.Translator.TranslateTo(out)
+	for i := range out.Spec.TargetRefs {
+		out.Spec.TargetRefs[i].Name = gatewayv1.ObjectName(
+			ctx.Translator.TranslateName(obj.Namespace, string(obj.Spec.TargetRefs[i].Name)),
 		)
 	}
-
-	for i := range hostPolicy.Spec.Validation.CACertificateRefs {
-		hostPolicy.Spec.Validation.CACertificateRefs[i].Name = gatewayv1.ObjectName(
-			r.Translator.TranslateName(obj.Namespace, string(obj.Spec.Validation.CACertificateRefs[i].Name)),
+	for i := range out.Spec.Validation.CACertificateRefs {
+		out.Spec.Validation.CACertificateRefs[i].Name = gatewayv1.ObjectName(
+			ctx.Translator.TranslateName(obj.Namespace, string(obj.Spec.Validation.CACertificateRefs[i].Name)),
 		)
 	}
-
-	return hostPolicy
+	return out
 }
 
-type BackendTLSPolicyStatusReconciler struct {
-	*Context
+// ── Public Add* functions ─────────────────────────────────────────────────────
+
+func AddGatewayAPISyncer(_ context.Context, virtMgr, hostMgr manager.Manager, clusterName, clusterNamespace string) error {
+	return addToHostSyncer(virtMgr, &toHostReconciler[*gatewayv1.HTTPRoute]{
+		Context:      newGatewayContext(clusterName, clusterNamespace, virtMgr, hostMgr),
+		finalizer:    gatewayAPIFinalizerName,
+		syncEnabled:  func(s *v1beta1.SyncConfig) (bool, map[string]string) { return s.HTTPRoutes.Enabled, s.HTTPRoutes.Selector },
+		translateObj: translateHTTPRoute,
+		newObj:       func() *gatewayv1.HTTPRoute { return &gatewayv1.HTTPRoute{} },
+	}, gatewayAPIControllerName)
 }
 
-func AddBackendTLSPolicyStatusSyncer(ctx context.Context, virtMgr, hostMgr manager.Manager, clusterName, clusterNamespace string) error {
-	reconciler := BackendTLSPolicyStatusReconciler{
-		Context: &Context{
-			ClusterName:      clusterName,
-			ClusterNamespace: clusterNamespace,
-			VirtualClient:    virtMgr.GetClient(),
-			HostClient:       hostMgr.GetClient(),
-			HostReader:       hostMgr.GetAPIReader(),
-			Translator: translate.ToHostTranslator{
-				ClusterName:      clusterName,
-				ClusterNamespace: clusterNamespace,
-			},
-		},
-	}
-	name := reconciler.Translator.TranslateName(clusterNamespace, backendTLSPolicyStatusControllerName)
-	return ctrl.NewControllerManagedBy(hostMgr).
-		Named(name).
-		For(&gatewayv1.BackendTLSPolicy{}).
-		WithEventFilter(predicate.NewPredicateFuncs(reconciler.filterHostPolicies)).
-		Complete(&reconciler)
+func AddGatewayAPIStatusSyncer(_ context.Context, virtMgr, hostMgr manager.Manager, clusterName, clusterNamespace string) error {
+	return addStatusSyncer(hostMgr, &statusReconciler[*gatewayv1.HTTPRoute]{
+		Context: newGatewayContext(clusterName, clusterNamespace, virtMgr, hostMgr),
+		kind:    "httproute",
+		newObj:  func() *gatewayv1.HTTPRoute { return &gatewayv1.HTTPRoute{} },
+	}, gatewayAPIStatusControllerName)
 }
 
-func (r *BackendTLSPolicyStatusReconciler) filterHostPolicies(obj ctrlruntimeclient.Object) bool {
-	return obj.GetLabels()[translate.ClusterNameLabel] == r.ClusterName
+func AddTLSRouteSyncer(_ context.Context, virtMgr, hostMgr manager.Manager, clusterName, clusterNamespace string) error {
+	return addToHostSyncer(virtMgr, &toHostReconciler[*gatewayv1.TLSRoute]{
+		Context:      newGatewayContext(clusterName, clusterNamespace, virtMgr, hostMgr),
+		finalizer:    tlsRouteFinalizerName,
+		syncEnabled:  func(s *v1beta1.SyncConfig) (bool, map[string]string) { return s.TLSRoutes.Enabled, s.TLSRoutes.Selector },
+		translateObj: translateTLSRoute,
+		newObj:       func() *gatewayv1.TLSRoute { return &gatewayv1.TLSRoute{} },
+	}, tlsRouteControllerName)
 }
 
-func (r *BackendTLSPolicyStatusReconciler) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
-	log := ctrl.LoggerFrom(ctx).WithValues("cluster", r.ClusterName, "clusterNamespace", r.ClusterNamespace)
-	ctx = ctrl.LoggerInto(ctx, log)
+func AddTLSRouteStatusSyncer(_ context.Context, virtMgr, hostMgr manager.Manager, clusterName, clusterNamespace string) error {
+	return addStatusSyncer(hostMgr, &statusReconciler[*gatewayv1.TLSRoute]{
+		Context: newGatewayContext(clusterName, clusterNamespace, virtMgr, hostMgr),
+		kind:    "tlsroute",
+		newObj:  func() *gatewayv1.TLSRoute { return &gatewayv1.TLSRoute{} },
+	}, tlsRouteStatusControllerName)
+}
 
-	var hostPolicy gatewayv1.BackendTLSPolicy
-	if err := r.HostClient.Get(ctx, req.NamespacedName, &hostPolicy); err != nil {
-		return reconcile.Result{}, ctrlruntimeclient.IgnoreNotFound(err)
-	}
+func AddReferenceGrantSyncer(_ context.Context, virtMgr, hostMgr manager.Manager, clusterName, clusterNamespace string) error {
+	return addToHostSyncer(virtMgr, &toHostReconciler[*gatewayv1.ReferenceGrant]{
+		Context:      newGatewayContext(clusterName, clusterNamespace, virtMgr, hostMgr),
+		finalizer:    referenceGrantFinalizerName,
+		syncEnabled:  func(s *v1beta1.SyncConfig) (bool, map[string]string) { return s.ReferenceGrants.Enabled, s.ReferenceGrants.Selector },
+		translateObj: translateReferenceGrant,
+		newObj:       func() *gatewayv1.ReferenceGrant { return &gatewayv1.ReferenceGrant{} },
+	}, referenceGrantControllerName)
+}
 
-	annotations := hostPolicy.GetAnnotations()
-	virtName := annotations[translate.ResourceNameAnnotation]
-	virtNamespace := annotations[translate.ResourceNamespaceAnnotation]
-	if virtName == "" || virtNamespace == "" {
-		return reconcile.Result{}, nil
-	}
+func AddBackendTLSPolicySyncer(_ context.Context, virtMgr, hostMgr manager.Manager, clusterName, clusterNamespace string) error {
+	return addToHostSyncer(virtMgr, &toHostReconciler[*gatewayv1.BackendTLSPolicy]{
+		Context:      newGatewayContext(clusterName, clusterNamespace, virtMgr, hostMgr),
+		finalizer:    backendTLSPolicyFinalizerName,
+		syncEnabled:  func(s *v1beta1.SyncConfig) (bool, map[string]string) { return s.BackendTLSPolicies.Enabled, s.BackendTLSPolicies.Selector },
+		translateObj: translateBackendTLSPolicy,
+		newObj:       func() *gatewayv1.BackendTLSPolicy { return &gatewayv1.BackendTLSPolicy{} },
+	}, backendTLSPolicyControllerName)
+}
 
-	var virtPolicy gatewayv1.BackendTLSPolicy
-	if err := r.VirtualClient.Get(ctx, types.NamespacedName{Name: virtName, Namespace: virtNamespace}, &virtPolicy); err != nil {
-		return reconcile.Result{}, ctrlruntimeclient.IgnoreNotFound(err)
-	}
-
-	if reflect.DeepEqual(virtPolicy.Status, hostPolicy.Status) {
-		return reconcile.Result{}, nil
-	}
-
-	log.Info("mirroring backendtlspolicy status to virtual cluster", "name", virtName, "namespace", virtNamespace)
-	virtPolicy.Status = hostPolicy.Status
-	return reconcile.Result{}, r.VirtualClient.Status().Update(ctx, &virtPolicy)
+func AddBackendTLSPolicyStatusSyncer(_ context.Context, virtMgr, hostMgr manager.Manager, clusterName, clusterNamespace string) error {
+	return addStatusSyncer(hostMgr, &statusReconciler[*gatewayv1.BackendTLSPolicy]{
+		Context: newGatewayContext(clusterName, clusterNamespace, virtMgr, hostMgr),
+		kind:    "backendtlspolicy",
+		newObj:  func() *gatewayv1.BackendTLSPolicy { return &gatewayv1.BackendTLSPolicy{} },
+	}, backendTLSPolicyStatusControllerName)
 }

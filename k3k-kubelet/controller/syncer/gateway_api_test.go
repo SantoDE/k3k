@@ -12,15 +12,13 @@ import (
 	"github.com/rancher/k3k/pkg/apis/k3k.io/v1beta1"
 )
 
-func newGatewayAPIReconciler(clusterName, clusterNamespace string) *GatewayAPIReconciler {
-	return &GatewayAPIReconciler{
-		Context: &Context{
+func newTestContext(clusterName, clusterNamespace string) *Context {
+	return &Context{
+		ClusterName:      clusterName,
+		ClusterNamespace: clusterNamespace,
+		Translator: translate.ToHostTranslator{
 			ClusterName:      clusterName,
 			ClusterNamespace: clusterNamespace,
-			Translator: translate.ToHostTranslator{
-				ClusterName:      clusterName,
-				ClusterNamespace: clusterNamespace,
-			},
 		},
 	}
 }
@@ -31,7 +29,7 @@ func gatewayNamespace(ns string) *gatewayv1.Namespace {
 }
 
 func TestHTTPRouteTranslation(t *testing.T) {
-	r := newGatewayAPIReconciler("mycluster", "host-ns")
+	r := newTestContext("mycluster", "host-ns")
 
 	tests := []struct {
 		name       string
@@ -166,7 +164,7 @@ func TestHTTPRouteTranslation(t *testing.T) {
 			originalName := tt.route.Spec.ParentRefs
 			_ = originalName
 
-			result := r.httproute(tt.route, tt.syncConfig)
+			result := translateHTTPRoute(r, tt.route, &v1beta1.SyncConfig{HTTPRoutes: tt.syncConfig})
 
 			// verify original is not mutated
 			if len(tt.route.Spec.ParentRefs) > 0 {
