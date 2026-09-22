@@ -343,20 +343,45 @@ func addControllers(ctx context.Context, hostMgr, virtualMgr manager.Manager, c 
 		return fmt.Errorf("failed to add ingress syncer controller: %w", err)
 	}
 
-	if gatewayAPIAvailable(virtualMgr) {
-		logger.Info("adding gateway api syncer controller")
-
+	if gatewayKindAvailable(virtualMgr, "HTTPRoute") {
 		if err := syncer.AddGatewayAPISyncer(ctx, virtualMgr, hostMgr, c.ClusterName, c.ClusterNamespace); err != nil {
 			return fmt.Errorf("failed to add gateway api syncer controller: %w", err)
 		}
-
-		logger.Info("adding gateway api status syncer controller")
 		if err := syncer.AddGatewayAPIStatusSyncer(ctx, virtualMgr, hostMgr, c.ClusterName, c.ClusterNamespace); err != nil {
 			return fmt.Errorf("failed to add gateway api status syncer controller: %w", err)
 		}
-		logger.Info("gateway api status syncer controller added")
 	} else {
-		logger.Info("gateway api crds not found, skipping gateway api syncer")
+		logger.Info("HTTPRoute CRD not found, skipping httproute syncer")
+	}
+
+	if gatewayKindAvailable(virtualMgr, "TLSRoute") {
+		if err := syncer.AddTLSRouteSyncer(ctx, virtualMgr, hostMgr, c.ClusterName, c.ClusterNamespace); err != nil {
+			return fmt.Errorf("failed to add tlsroute syncer controller: %w", err)
+		}
+		if err := syncer.AddTLSRouteStatusSyncer(ctx, virtualMgr, hostMgr, c.ClusterName, c.ClusterNamespace); err != nil {
+			return fmt.Errorf("failed to add tlsroute status syncer controller: %w", err)
+		}
+	} else {
+		logger.Info("TLSRoute CRD not found, skipping tlsroute syncer")
+	}
+
+	if gatewayKindAvailable(virtualMgr, "ReferenceGrant") {
+		if err := syncer.AddReferenceGrantSyncer(ctx, virtualMgr, hostMgr, c.ClusterName, c.ClusterNamespace); err != nil {
+			return fmt.Errorf("failed to add referencegrant syncer controller: %w", err)
+		}
+	} else {
+		logger.Info("ReferenceGrant CRD not found, skipping referencegrant syncer")
+	}
+
+	if gatewayKindAvailable(virtualMgr, "BackendTLSPolicy") {
+		if err := syncer.AddBackendTLSPolicySyncer(ctx, virtualMgr, hostMgr, c.ClusterName, c.ClusterNamespace); err != nil {
+			return fmt.Errorf("failed to add backendtlspolicy syncer controller: %w", err)
+		}
+		if err := syncer.AddBackendTLSPolicyStatusSyncer(ctx, virtualMgr, hostMgr, c.ClusterName, c.ClusterNamespace); err != nil {
+			return fmt.Errorf("failed to add backendtlspolicy status syncer controller: %w", err)
+		}
+	} else {
+		logger.Info("BackendTLSPolicy CRD not found, skipping backendtlspolicy syncer")
 	}
 
 	logger.Info("adding pvc syncer controller")
@@ -378,14 +403,10 @@ func addControllers(ctx context.Context, hostMgr, virtualMgr manager.Manager, c 
 	return nil
 }
 
-// gatewayAPIAvailable reports whether the virtual cluster has Gateway API CRDs installed.
-// If not, the Gateway API syncer is skipped to avoid crashing the manager on startup.
-func gatewayAPIAvailable(virtMgr manager.Manager) bool {
-	mapper := virtMgr.GetRESTMapper()
-
-	_, err := mapper.RESTMapping(
-		schema.GroupKind{Group: "gateway.networking.k8s.io", Kind: "HTTPRoute"},
+// gatewayKindAvailable reports whether the virtual cluster has the given Gateway API kind installed.
+func gatewayKindAvailable(virtMgr manager.Manager, kind string) bool {
+	_, err := virtMgr.GetRESTMapper().RESTMapping(
+		schema.GroupKind{Group: "gateway.networking.k8s.io", Kind: kind},
 	)
-
 	return err == nil
 }

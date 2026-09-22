@@ -300,6 +300,21 @@ type SyncConfig struct {
 	// +kubebuilder:default={"enabled": false}
 	// +optional
 	HTTPRoutes GatewayAPISyncConfig `json:"httpRoutes"`
+	// TLSRoutes resources sync configuration.
+	//
+	// +kubebuilder:default={"enabled": false}
+	// +optional
+	TLSRoutes GatewayAPISyncConfig `json:"tlsRoutes"`
+	// ReferenceGrants resources sync configuration.
+	//
+	// +kubebuilder:default={"enabled": false}
+	// +optional
+	ReferenceGrants BasicSyncConfig `json:"referenceGrants"`
+	// BackendTLSPolicies resources sync configuration.
+	//
+	// +kubebuilder:default={"enabled": false}
+	// +optional
+	BackendTLSPolicies BasicSyncConfig `json:"backendTLSPolicies"`
 	// PersistentVolumeClaims resources sync configuration.
 	//
 	// +kubebuilder:default={"enabled": true}
@@ -403,6 +418,21 @@ type GatewayAPISyncConfig struct {
 	//
 	// +optional
 	OverrideParentGateway *GatewayParentRef `json:"overrideParentGateway,omitempty"`
+}
+
+// BasicSyncConfig specifies the sync options for resources that have no route-specific translation.
+type BasicSyncConfig struct {
+	// Enabled is an on/off switch for syncing resources.
+	//
+	// +kubebuilder:default=false
+	// +required
+	Enabled bool `json:"enabled"`
+
+	// Selector specifies set of labels of the resources that will be synced, if empty
+	// then all resources of the given type will be synced.
+	//
+	// +optional
+	Selector map[string]string `json:"selector,omitempty"`
 }
 
 // GatewayParentRef identifies a Gateway on the host cluster.
